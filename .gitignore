@@ -1,0 +1,26 @@
+# LaTeX intermediates
+*.aux
+*.log
+*.out
+*.toc
+*.bbl
+*.blg
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+
+# OS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp

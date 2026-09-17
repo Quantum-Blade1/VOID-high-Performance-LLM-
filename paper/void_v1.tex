@@ -1,0 +1,1028 @@
+% !TeX program = pdflatex
+% void_v1: A Differential-Attention Sub-1B Language Model Specialized for Code
+% and Command-Line Reasoning
+%
+% Author:  Krish Kumar Sharma
+% Version: v0.1 (design paper, pre-training)
+% Date:    September 2026
+
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage[round,authoryear]{natbib}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{graphicx}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{titlesec}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    citecolor=blue!60!black,
+    urlcolor=blue!60!black
+}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+\newtheorem{corollary}{Corollary}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{assumption}{Assumption}
+
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+% Notation shortcuts
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\softmax}{\mathrm{softmax}}
+\newcommand{\rmsnorm}{\mathrm{RMSNorm}}
+\newcommand{\rope}{\mathrm{RoPE}}
+\newcommand{\swiglu}{\mathrm{SwiGLU}}
+\newcommand{\silu}{\mathrm{SiLU}}
+\newcommand{\attn}{\mathrm{Attn}}
+\newcommand{\diffattn}{\mathrm{DiffAttn}}
+\newcommand{\Var}{\mathrm{Var}}
+
+\title{\textbf{void\_v1}: A Differential-Attention Sub-1B Language Model \\
+       Specialized for Code and Command-Line Reasoning \\[0.5em]
+       \large Design Paper (v0.1, pre-training)}
+\author{Krish Kumar Sharma}
+\date{September 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present the design of \textbf{void\_v1}, a 480M-parameter decoder-only
+language model targeted at code generation and command-line reasoning, to be
+trained from scratch on a curated 100B-token corpus using free-tier and
+low-cost cloud compute. The architecture combines a deep-and-narrow scaling
+regime with grouped-query attention, RoPE positional encoding with an extended
+frequency base, a mixed sliding-window / full attention pattern, register
+tokens, and Multi-Token Prediction heads for training-time auxiliary loss. Our
+central architectural bet is the adoption of \emph{Differential Attention} at
+the sub-1B parameter scale, a mechanism previously proposed by
+\citet{ye2024differential} for reducing attention noise, but not yet published
+in any released model at this size class. We formalise the noise-cancellation
+argument as an inequality on expected off-diagonal attention mass, derive
+closed-form parameter and FLOP budgets for the architecture, and compare
+void\_v1 theoretically against five reference models in the 350M--1.3B range
+(Pythia-410M, MobileLLM-350M, SmolLM2-360M, Qwen2.5-Coder-0.5B,
+DeepSeek-Coder-1.3B). We further describe a three-stage curriculum with
+teacher distillation from Qwen2.5-Coder-7B and an accompanying release plan
+including a novel command-line reasoning benchmark, \textbf{void-cli-bench}.
+This document is a design paper: no empirical results are yet available. All
+predicted numbers are labelled as such and are conditioned on the training
+recipe stated herein.
+\end{abstract}
+
+\tableofcontents
+\vspace{1em}
+
+%======================================================================
+\section{Introduction}
+%======================================================================
+
+The sub-1B parameter regime for large language models (LLMs) has, in the
+last twelve months, become surprisingly competitive.
+Qwen2.5-Coder-0.5B~\citep{hui2024qwen25coder} reaches HumanEval pass@1 of
+40.5, exceeding several 7B-class general-purpose models on code, while
+SmolLM2-1.7B~\citep{allal2025smollm2} matches or beats larger models on
+common-sense reasoning through aggressive over-training and data curation.
+These results demonstrate that at small scale, \emph{training recipe} ---
+not raw parameter count --- is the dominant driver of downstream quality.
+
+Yet the architectures used by these models are strikingly similar: a
+Llama-family decoder~\citep{touvron2023llama} with grouped-query attention
+(GQA)~\citep{ainslie2023gqa}, rotary positional
+embeddings~\citep{su2024roformer}, RMSNorm~\citep{zhang2019rmsnorm}, and a
+SwiGLU feed-forward network~\citep{shazeer2020swiglu}. Recent research has
+proposed a range of drop-in architectural improvements
+(Differential Attention~\citep{ye2024differential},
+Multi-Token Prediction~\citep{gloeckle2024mtp,deepseek2024v3},
+register tokens~\citep{darcet2024registers},
+QK-normalization~\citep{chameleon2024,dehghani2023vit22b}, the
+Muon optimizer~\citep{jordan2024muon}), but no released model below 1B
+parameters currently combines these techniques.
+
+We propose \textbf{void\_v1} to fill that gap and, in the process, plant a
+falsifiable research flag: \emph{Does Differential Attention improve code
+generation quality at 480M parameters when trained on a code-specialized
+corpus with distillation from a code-specialist teacher, relative to an
+otherwise identical standard GQA baseline?}
+
+\paragraph{Contributions.} This design paper contributes:
+\begin{enumerate}[leftmargin=1.5em,itemsep=0.2em]
+    \item A concrete 480M-parameter decoder architecture (\S\ref{sec:arch})
+          combining seven proven-in-2024 techniques at a scale where the
+          specific combination has not been published, with parameter and
+          FLOP budgets derived from first principles (\S\ref{sec:budget}).
+    \item A theoretical analysis of Differential Attention as a
+          noise-cancellation operator, formalised as
+          Theorem~\ref{thm:diffattn} on the expected off-diagonal attention
+          mass (\S\ref{sec:theory}).
+    \item A theoretical comparison with five reference models in the
+          350M--1.3B range under identical assumptions (\S\ref{sec:compare}).
+    \item A three-stage training curriculum with teacher distillation and
+          an accompanying command-line reasoning benchmark
+          (\S\ref{sec:training}, \S\ref{sec:eval}).
+    \item An explicit risk register and ablation plan
+          (\S\ref{sec:risks}) with graceful-degradation contracts for each
+          novel component.
+\end{enumerate}
+
+\paragraph{Scope and limits.} This is a \emph{design paper}. No pretraining
+run has yet been executed. Every quantitative statement about void\_v1 in
+this document is either (a) a mathematical derivation from the stated
+configuration, or (b) an \emph{expected value} conditioned on the training
+recipe and derived by comparison with published models of similar scale.
+We explicitly mark expected values throughout.
+
+%======================================================================
+\section{Related Work}
+\label{sec:related}
+%======================================================================
+
+\subsection{Sub-1B language models}
+
+The Pythia suite~\citep{biderman2023pythia} established the modern baseline
+for small-model pretraining, with Pythia-410M trained on 300B tokens of the
+Pile~\citep{gao2020pile}. Meta's MobileLLM~\citep{liu2024mobilellm}
+demonstrated that at the sub-1B scale, \emph{depth} is more valuable than
+\emph{width} per parameter: a 350M-parameter model with 30 layers
+outperforms a comparably-sized wider model on reasoning benchmarks by
+substantial margins. HuggingFace's SmolLM2 line~\citep{allal2025smollm2}
+pushed the field forward by treating data quality (via FineWeb-Edu and
+Cosmopedia synthetic textbook data) and over-training (11T tokens on the
+1.7B model) as the primary quality levers.
+
+\subsection{Code-specialized small models}
+
+DeepSeek-Coder~\citep{guo2024deepseekcoder} introduced repository-level
+sequence packing based on file-import topological sort, yielding
+substantial gains on cross-file code completion. The Qwen2.5-Coder
+family~\citep{hui2024qwen25coder} demonstrated that a 494M-parameter model
+trained on 5.5T tokens of code-heavy data with fill-in-the-middle (FIM)
+formatting~\citep{bavarian2022fim} can reach HumanEval pass@1 of 40.5,
+setting the current small-model state of the art.
+
+\subsection{Attention mechanism variants}
+
+Grouped-Query Attention~\citep{ainslie2023gqa} reduces the KV-cache memory
+footprint by sharing K and V across groups of Q heads, with negligible
+quality loss up to sharing ratios of 8:1. Mistral-7B~\citep{jiang2023mistral}
+introduced sliding-window attention, later combined with full attention in
+Gemma-2~\citep{team2024gemma2} to yield an alternating pattern that
+preserves long-range integration while reducing per-layer attention FLOPs.
+QK-normalization~\citep{chameleon2024,dehghani2023vit22b} applies RMSNorm to
+queries and keys prior to the dot product, preventing attention entropy
+collapse in late training.
+
+\textbf{Differential Attention}~\citep{ye2024differential}, proposed by
+Microsoft Research in late 2024, computes two attention distributions with
+independently-projected query and key matrices and returns their weighted
+difference. The stated motivation is analogous to a differential amplifier in
+analog circuits: common-mode noise present in both attention distributions
+cancels, while informative signal that differs between the two branches
+survives. Ablations at 3B parameters show consistent perplexity improvements
+and reduced hallucination on question-answering benchmarks. To our knowledge,
+no released model below 3B parameters currently uses this mechanism.
+
+\subsection{Training-recipe innovations}
+
+Multi-Token Prediction~\citep{gloeckle2024mtp} adds auxiliary heads that
+predict tokens $t+2, t+3, \dots$ at training time, discarded at inference.
+DeepSeek-V3~\citep{deepseek2024v3} demonstrates that MTP improves both
+convergence speed and downstream generation quality. Register
+tokens~\citep{darcet2024registers}, originally proposed for vision
+transformers, provide dedicated "attention sinks" that reduce spurious
+attention on semantically empty tokens. The Muon optimizer~\citep{jordan2024muon},
+which applies orthogonal matrix updates via Newton-Schulz iteration, has
+demonstrated 1.5--2$\times$ sample efficiency over AdamW on
+small-model benchmarks in the nanoGPT speedrun community.
+
+%======================================================================
+\section{void\_v1 Architecture}
+\label{sec:arch}
+%======================================================================
+
+\subsection{Design principles}
+
+Three principles govern the design:
+
+\begin{enumerate}[leftmargin=1.5em,itemsep=0.2em]
+    \item \textbf{Depth over width.} At $\leq 1$B parameters, we allocate the
+          parameter budget toward more layers rather than wider hidden
+          dimensions, following the MobileLLM ablations.
+    \item \textbf{One controlled novelty.} Exactly one component
+          (Differential Attention) is a novel bet; all other choices are
+          drawn from published models with reproducible ablations. This
+          keeps the debugging surface small when interpreting training
+          failures.
+    \item \textbf{Graceful degradation.} Every novel or non-standard
+          component has a documented rollback path
+          (\S\ref{sec:risks}) that preserves the ability to ship a
+          reduced-scope model if the component underperforms.
+\end{enumerate}
+
+\subsection{Overall configuration}
+\label{sec:config}
+
+Let $d$ denote the hidden dimension, $L$ the number of transformer layers,
+$H$ the number of query heads, $H_{kv}$ the number of key/value heads (with
+$H \bmod H_{kv} = 0$), $d_h = d / H$ the head dimension, $d_{ff}$ the
+feed-forward inner dimension, $V$ the vocabulary size, and $S$ the maximum
+sequence length. The full configuration is:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lr}
+\toprule
+\textbf{Hyperparameter} & \textbf{Value} \\
+\midrule
+Hidden dimension $d$                                 & 960 \\
+Number of transformer layers $L$                     & 32 \\
+Query heads $H$                                      & 15 \\
+Key/Value heads $H_{kv}$ (GQA ratio 3:1)             & 5 \\
+Head dimension $d_h$                                 & 64 \\
+FFN inner dimension $d_{ff}$                         & 2560 \\
+Vocabulary size $V$                                  & 49{,}152 \\
+Max sequence length $S$                              & 2048 \\
+RoPE frequency base $\theta$                         & 500{,}000 \\
+Register tokens $R$                                  & 4 \\
+Number of MTP heads (training only)                  & 2 (predicting $t+2, t+3$) \\
+Tied input/output embeddings                         & Yes \\
+Normalisation                                        & RMSNorm ($\epsilon = 10^{-5}$) \\
+Activation (FFN)                                     & SwiGLU \\
+Attention pattern                                    & See \S\ref{sec:attnpattern} \\
+Attention head normalisation                         & QK-norm on both branches \\
+Bias in linear layers                                & None \\
+Weight init                                          & $\mathcal{N}(0, 0.02)$, residual projs $\times 1/\sqrt{2L}$ \\
+Dropout                                              & 0 \\
+\bottomrule
+\end{tabular}
+\caption{void\_v1 architectural configuration.}
+\label{tab:config}
+\end{table}
+
+The total parameter count $N$ derives from the configuration as follows.
+Let $T_\text{embed} = V \cdot d = 49{,}152 \cdot 960 = 4.72 \times 10^7$
+(counted once due to embedding tying). Per transformer layer, the
+attention module contributes
+\begin{align}
+T_\text{attn}
+    &= \underbrace{2\, d \cdot H d_h}_{\text{2 Q projections}}
+     + \underbrace{2\, d \cdot H_{kv} d_h}_{\text{2 K projections}}
+     + \underbrace{d \cdot H_{kv} d_h}_{\text{1 V projection}}
+     + \underbrace{H d_h \cdot d}_{\text{output projection}} \nonumber \\
+    &\quad + \underbrace{d + 4 d_h}_{\text{RMSNorm, QK-norm, }\lambda} \nonumber \\
+    &= 2 \cdot 960 \cdot 960 + 2 \cdot 960 \cdot 320 + 960 \cdot 320 + 960 \cdot 960
+     + \text{(negligible)} \nonumber \\
+    &\approx 3.17 \times 10^6.
+\end{align}
+Note the "2 Q projections" and "2 K projections" terms: Differential
+Attention (\S\ref{sec:diffattn}) uses two independently-projected
+Q and K matrices. V is shared across both branches. This adds
+$d \cdot (H d_h + H_{kv} d_h) = 960 \cdot (960 + 320) \approx 1.23 \times 10^6$
+parameters per layer compared to a standard GQA attention module, an
+overhead of $\sim 63\%$ on the attention parameters and $\sim 8\%$ on the
+whole model (since attention is only part of each layer).
+
+The SwiGLU FFN contributes
+\begin{equation}
+T_\text{ffn} = 3 \cdot d \cdot d_{ff} = 3 \cdot 960 \cdot 2560 = 7.37 \times 10^6.
+\end{equation}
+Total per layer: $T_\text{attn} + T_\text{ffn} + T_\text{norms} \approx
+10.55 \times 10^6$.
+
+The final RMSNorm adds $d = 960$ parameters. The MTP heads add
+$2 \cdot d \cdot V = 2 \cdot 960 \cdot 49{,}152 \approx 9.44 \times 10^7$
+parameters, but these are (a) discarded at inference and (b) can be tied to
+the main LM head to eliminate the cost entirely; we adopt full tying in
+void\_v1.
+
+Summing:
+\begin{equation}
+N \approx T_\text{embed} + L \cdot T_\text{layer} + O(d)
+     = 4.72 \times 10^7 + 32 \cdot 1.055 \times 10^7
+     \approx 4.85 \times 10^8.
+\end{equation}
+i.e.\ $N \approx 485$M parameters, consistent with the "$\sim 480$M" claim
+in the abstract.
+
+\subsection{Differential Grouped-Query Attention}
+\label{sec:diffattn}
+
+The core novel component. For an input sequence
+$\mathbf{X} \in \R^{S \times d}$, standard scaled dot-product
+attention with GQA computes
+\begin{align}
+Q &= \mathbf{X} W_Q,\quad W_Q \in \R^{d \times H d_h}, \\
+K &= \mathbf{X} W_K,\quad W_K \in \R^{d \times H_{kv} d_h}, \\
+V &= \mathbf{X} W_V,\quad W_V \in \R^{d \times H_{kv} d_h}, \\
+\attn(Q, K, V) &= \softmax\!\left(\frac{Q K^\top}{\sqrt{d_h}} + M\right) V,
+\end{align}
+where $M$ is a causal mask and K, V are broadcast across the
+$H / H_{kv}$ Q heads that share each KV head.
+
+Differential GQA introduces a second Q and K projection:
+\begin{align}
+Q_1 &= \rmsnorm_\text{QK}(\rope(\mathbf{X} W_{Q_1})), \\
+Q_2 &= \rmsnorm_\text{QK}(\rope(\mathbf{X} W_{Q_2})), \\
+K_1 &= \rmsnorm_\text{QK}(\rope(\mathbf{X} W_{K_1})), \\
+K_2 &= \rmsnorm_\text{QK}(\rope(\mathbf{X} W_{K_2})), \\
+V   &= \mathbf{X} W_V.
+\end{align}
+The attention scores are then combined:
+\begin{equation}
+\diffattn(\mathbf{X})
+   = \left[
+       \softmax\!\left(\tfrac{Q_1 K_1^\top}{\sqrt{d_h}} + M\right)
+     - \lambda(t) \cdot
+       \softmax\!\left(\tfrac{Q_2 K_2^\top}{\sqrt{d_h}} + M\right)
+     \right] V,
+\label{eq:diffattn}
+\end{equation}
+where $\lambda(t) \in \R$ is a learnable, time-varying scalar per layer:
+\begin{equation}
+\lambda(t) = \exp(\lambda_{q_1} \cdot \lambda_{k_1})
+           - \exp(\lambda_{q_2} \cdot \lambda_{k_2}) + \lambda_\text{init},
+\end{equation}
+with $\lambda_{q_i}, \lambda_{k_i} \in \R^{d_h}$ learnable and
+$\lambda_\text{init} = 0.8 - 0.6 \exp(-0.3 \cdot (\ell - 1))$ for layer
+index $\ell$, following the schedule of \citet{ye2024differential}.
+This schedule ensures $\lambda(0) \approx 0.2$ in the deepest layer and
+$\lambda(0) \approx 0.8$ in shallow layers at initialization, biasing
+early layers toward stronger differential subtraction.
+
+Cost. Compared to standard GQA, differential GQA doubles the Q and K
+projection parameters (V unchanged) and roughly doubles the attention
+score computation (two softmaxes). For a training-compute breakdown, see
+\S\ref{sec:budget}.
+
+\subsection{Mixed attention pattern}
+\label{sec:attnpattern}
+
+Not all layers use full attention. Following the Mistral/Gemma-2 design,
+we adopt a mixed pattern:
+\begin{itemize}[leftmargin=1.5em,itemsep=0.2em]
+    \item \textbf{Layers 1--4:} full attention (early integration of
+          broad context).
+    \item \textbf{Layers 5--24:} alternating block of
+          \{sliding-window (window=512), sliding-window, sliding-window, full\},
+          repeated 5 times.
+    \item \textbf{Layers 25--32:} full attention (final high-level
+          integration).
+\end{itemize}
+This distributes 12 full-attention and 20 sliding-window layers, reducing
+per-token attention FLOPs by approximately 40\% at sequence length 2048
+while preserving the ability of the network to integrate long-range
+context.
+
+\subsection{Multi-Token Prediction (MTP) heads}
+\label{sec:mtp}
+
+At training time only, two auxiliary linear heads $\phi_2, \phi_3$ take the
+final hidden state $h_t$ and predict tokens at positions $t+2$ and $t+3$
+respectively. The training loss is
+\begin{equation}
+\mathcal{L}_\text{MTP}
+   = \mathcal{L}_\text{CE}(h_t, x_{t+1})
+   + \alpha_2\, \mathcal{L}_\text{CE}(\phi_2(h_t), x_{t+2})
+   + \alpha_3\, \mathcal{L}_\text{CE}(\phi_3(h_t), x_{t+3}),
+\end{equation}
+with $\alpha_2 = \alpha_3 = 0.3$ following the DeepSeek-V3 recipe.
+The MTP heads share weights with the main LM head via linear projections
+of the hidden state through separate small transformer blocks
+(one layer each), an approach that adds $\sim 2$M parameters per MTP head
+and is discarded at inference.
+
+\subsection{Register tokens}
+\label{sec:registers}
+
+Four learnable register tokens $\mathbf{r}_1, \dots, \mathbf{r}_4 \in \R^d$ are
+prepended to every input sequence, making the effective input
+$[\mathbf{r}_1, \dots, \mathbf{r}_4, x_1, \dots, x_S]$. These tokens receive
+no supervision signal (their positions are masked in the loss) and serve
+as dedicated attention sinks, reducing attention entropy on the
+semantically meaningful tokens \citep{darcet2024registers}.
+
+\subsection{Optimizer choice}
+\label{sec:optim}
+
+We use \textbf{Muon}~\citep{jordan2024muon} for hidden-layer weight
+matrices (attention Q/K/V/O projections, FFN gate/up/down) and
+\textbf{AdamW}~\citep{loshchilov2019adamw} for embedding, LM head, norms,
+$\lambda$-scalars, and biases (of which there are none in linear layers
+by design). Muon applies an orthogonal step:
+\begin{equation}
+W_{t+1} = W_t - \eta \cdot \mathrm{NewtonSchulz}_5(G_t),
+\end{equation}
+where $G_t$ is the gradient and $\mathrm{NewtonSchulz}_5$ approximates
+the polar-decomposition orthogonal factor via five Newton-Schulz
+iterations. Empirically, Muon achieves 1.5--2$\times$ sample efficiency
+over AdamW on nanoGPT-scale benchmarks and is our primary lever for
+training-token efficiency.
+
+%======================================================================
+\section{Theoretical Analysis}
+\label{sec:theory}
+%======================================================================
+
+We now formalise three claims that motivate the void\_v1 architecture.
+
+\subsection{Attention noise decomposition}
+
+\begin{definition}[Attention noise]
+Fix a query index $i$ and a key sequence of length $n$. Let
+$A_i = \softmax(q_i K^\top / \sqrt{d_h})$ be the row-$i$ attention
+distribution. Let $\mathcal{S} \subseteq \{1,\dots,n\}$ be the set of
+\emph{semantically relevant} key positions for query $i$
+(under some oracle relevance measure). Define the \textbf{off-diagonal
+mass} as
+\begin{equation}
+\mathcal{N}(A_i) = \sum_{j \notin \mathcal{S}} A_{i,j}.
+\end{equation}
+$\mathcal{N}(A_i) \in [0, 1]$ measures the fraction of attention
+"leaked" onto irrelevant tokens.
+\end{definition}
+
+\begin{assumption}[Common-mode noise]
+\label{ass:commonmode}
+For any query $i$, there exist \emph{signal} distributions
+$A^{(s)}_1, A^{(s)}_2 \in \R^n$ (concentrated on $\mathcal{S}$) and a
+\emph{shared noise} distribution $\mathcal{N}_c \in \R^n$
+(concentrated on $\{1,\dots,n\} \setminus \mathcal{S}$)
+such that the standard-attention outputs of the two branches decompose as
+\begin{align}
+A^{(1)}_i &= A^{(s)}_1 + \mathcal{N}_c + \epsilon_1, \\
+A^{(2)}_i &= A^{(s)}_2 + \mathcal{N}_c + \epsilon_2,
+\end{align}
+where $\epsilon_1, \epsilon_2$ are independent zero-mean residuals with
+$\E[\epsilon_i] = 0$ and $\Var(\epsilon_i) = \sigma^2$.
+\end{assumption}
+
+Assumption~\ref{ass:commonmode} is the key modeling step. It asserts that
+two attention branches operating on the same input, but with different Q/K
+projections, will produce (i) different attempts at capturing the true
+signal, and (ii) similar noise patterns on the irrelevant-token subset
+$\{1,\dots,n\} \setminus \mathcal{S}$, because that noise arises from
+common input features (e.g.\ high-frequency positional artifacts, repeated
+sub-tokens, embedding-space clustering).
+
+\subsection{Differential attention noise reduction}
+
+\begin{theorem}[Off-diagonal mass reduction]
+\label{thm:diffattn}
+Let $A^{\diffattn}_i = A^{(1)}_i - \lambda A^{(2)}_i$ denote the
+(un-renormalised) differential attention row for query $i$, with
+$\lambda \in [0, 1]$. Under Assumption~\ref{ass:commonmode},
+\begin{equation}
+\E[\mathcal{N}(A^{\diffattn}_i)]
+    = (1 - \lambda) \, \E[\mathcal{N}(\mathcal{N}_c)]
+    + \E[\mathcal{N}(A^{(s)}_1 - \lambda A^{(s)}_2)]
+    + O(\sigma).
+\end{equation}
+In particular, for $\lambda = 1$, the shared-noise contribution vanishes:
+\begin{equation}
+\E[\mathcal{N}(A^{\diffattn}_i)]_{\lambda=1}
+    = \E[\mathcal{N}(A^{(s)}_1 - A^{(s)}_2)] + O(\sigma).
+\end{equation}
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+By linearity of expectation and Assumption~\ref{ass:commonmode},
+\begin{align}
+\mathcal{N}(A^{\diffattn}_i)
+    &= \sum_{j \notin \mathcal{S}}
+       (A^{(1)}_{i,j} - \lambda A^{(2)}_{i,j}) \\
+    &= \sum_{j \notin \mathcal{S}}
+       \left[
+         (A^{(s)}_{1,j} - \lambda A^{(s)}_{2,j})
+         + (1 - \lambda) \mathcal{N}_{c,j}
+         + (\epsilon_{1,j} - \lambda \epsilon_{2,j})
+       \right].
+\end{align}
+Since $A^{(s)}_1, A^{(s)}_2$ are concentrated on $\mathcal{S}$, the first
+term contributes to $\mathcal{N}(\cdot)$ only through residual leakage,
+which we absorb into $\E[\mathcal{N}(A^{(s)}_1 - \lambda A^{(s)}_2)]$.
+Taking expectations, the residual term
+$\E[\epsilon_{1,j} - \lambda \epsilon_{2,j}] = 0$ contributes $O(\sigma)$
+(with the constant depending on $|\mathcal{S}^c|$ and $\lambda$).
+The shared-noise term scales linearly with $(1 - \lambda)$, giving the
+claimed decomposition.
+\end{proof}
+
+\begin{remark}
+The theorem does \emph{not} claim that $A^{\diffattn}_i$ is itself a
+probability distribution --- it is not, in general. Both branches
+independently produce valid softmax outputs; their difference lies in
+$[-1, 1]$ pointwise. In practice, the raw difference is then multiplied
+by $V$ and fed through subsequent RMSNorm layers, so the value-vector
+mixing recovers well-scaled activations. This is the standard treatment
+in \citet{ye2024differential}. An alternative interpretation is that
+$\diffattn$ produces a signed "attention field" rather than a
+probability, and $\lambda$ acts as a gain control on the second branch.
+\end{remark}
+
+\begin{corollary}[Practical implication]
+When Assumption~\ref{ass:commonmode} holds strongly (high common-mode
+noise, low residual variance), Differential Attention with
+$\lambda \to 1$ produces cleaner attention over informative tokens. When
+$\lambda \to 0$, differential attention reduces to standard attention on
+the first branch; the second branch is then a redundant regularizer.
+The learnable schedule for $\lambda(t)$ (\S\ref{sec:diffattn}) allows
+the model to interpolate between these regimes per layer and per
+training step.
+\end{corollary}
+
+\subsection{Parameter efficiency of GQA}
+
+\begin{proposition}[GQA parameter savings]
+Let $\rho = H / H_{kv}$ denote the GQA sharing ratio. Compared to
+multi-head attention ($\rho = 1$), grouped-query attention saves
+\begin{equation}
+\Delta T_\text{attn}
+   = 2 \cdot d \cdot d_h \cdot H \cdot \left(1 - \frac{1}{\rho}\right)
+\end{equation}
+parameters per layer on the K and V projections combined. For void\_v1
+($d = 960$, $d_h = 64$, $H = 15$, $\rho = 3$), this saves
+$2 \cdot 960 \cdot 64 \cdot 15 \cdot (2/3) \approx 1.23 \times 10^6$
+parameters per layer, or $\sim 39$M parameters across the 32-layer
+model --- a $\sim 8\%$ reduction in total parameter count for
+negligible quality loss per published GQA ablations \citep{ainslie2023gqa}.
+Moreover, the KV cache at inference shrinks by $1 - 1/\rho = 2/3$,
+reducing memory pressure during generation.
+\end{proposition}
+
+\subsection{MTP as implicit regularization}
+
+\begin{proposition}[MTP as multi-task regularization]
+The MTP training objective
+\begin{equation}
+\mathcal{L}_\text{MTP}
+   = \mathcal{L}_\text{CE}(h_t, x_{t+1})
+   + \sum_{k=2}^{K} \alpha_k \mathcal{L}_\text{CE}(\phi_k(h_t), x_{t+k})
+\end{equation}
+can be viewed as a multi-task learning objective in which the shared
+representation $h_t$ must simultaneously support prediction of the
+immediate next token and of tokens further into the future. By the
+standard multi-task learning analysis \citep{caruana1997multitask}, this
+biases $h_t$ toward representations that capture longer-range
+predictive structure rather than only local next-token statistics,
+providing an implicit regularization against overfitting to short-range
+patterns.
+\end{proposition}
+
+This is a heuristic argument, not a rigorous bound. The empirical
+evidence from DeepSeek-V3 (which reports both faster convergence and
+better downstream evals with MTP heads) supports the interpretation.
+
+\subsection{FLOPs and memory budget}
+\label{sec:budget}
+
+\paragraph{Forward-pass FLOPs.} For one token at sequence position $t$
+with sequence length $S$:
+\begin{itemize}[leftmargin=1.5em,itemsep=0.2em]
+    \item Attention Q/K/V projections:
+          $2 \cdot d \cdot (2 H d_h + 2 H_{kv} d_h + H_{kv} d_h) \approx
+          6.34 \times 10^6$ FLOPs (dominated by diff-attn's 2$\times$ Q/K).
+    \item Attention scores:
+          $2 \cdot S \cdot H d_h \cdot 2 \approx 4 S \cdot d$ FLOPs
+          (two softmaxes over $S$).
+    \item Attention output projection: $2 \cdot d \cdot d \approx
+          1.84 \times 10^6$ FLOPs.
+    \item FFN: $2 \cdot 3 \cdot d \cdot d_{ff} = 1.47 \times 10^7$ FLOPs.
+    \item Per-layer total: $\approx 2.3 \times 10^7$ FLOPs per token
+          at $S = 2048$.
+    \item 32 layers: $\approx 7.4 \times 10^8$ FLOPs per token.
+    \item Embedding + final head (tied): $2 \cdot d \cdot V \approx
+          9.4 \times 10^7$ FLOPs per token.
+    \item MTP heads (train only): additional $\sim 3 \times 10^7$ FLOPs.
+\end{itemize}
+\textbf{Total forward: $\approx 8.4 \times 10^8$ FLOPs/token (train), or
+$\approx 8.1 \times 10^8$ FLOPs/token (inference, no MTP)}.
+
+\paragraph{Backward pass.} Approximately $2 \times$ the forward pass.
+Total training FLOPs per token: $\approx 2.5 \times 10^9$.
+
+\paragraph{Training-run FLOP budget.} For 100B tokens:
+$100 \times 10^9 \cdot 2.5 \times 10^9 = 2.5 \times 10^{20}$ FLOPs.
+On a Kaggle TPU v3-8 at $\sim 180$ TFLOPS sustained, this is
+$\sim 386$ compute-hours, or approximately 4--5 months of wall-clock at
+20 hours/week free allocation. On a rented H100 at $\sim 400$ TFLOPS
+sustained, this is $\sim 175$ hours, or one training run for roughly
+\$350--700 at spot pricing.
+
+\paragraph{Memory (bf16 mixed precision, single GPU).}
+Model parameters (bf16): $2 \cdot 485 \times 10^6 = 0.97$ GB.
+Gradients (bf16): 0.97 GB.
+Optimizer states (fp32 for AdamW parameters, Muon has smaller state):
+$\sim 3.5$ GB.
+Activations at $S = 2048$, batch $= 8$, with gradient checkpointing at
+every 4 layers: $\sim 4$ GB.
+KV cache during generation (GQA, batch $= 1$, full 2048 context):
+$2 \cdot L \cdot H_{kv} \cdot d_h \cdot S \cdot 2 =
+2 \cdot 32 \cdot 5 \cdot 64 \cdot 2048 \cdot 2 = 168$ MB.
+\textbf{Total peak training memory: $\sim 10$ GB} --- fits comfortably on
+a 24 GB consumer GPU or on Kaggle T4$\times$2 (with FSDP or DDP).
+
+%======================================================================
+\section{Training Methodology}
+\label{sec:training}
+%======================================================================
+
+\subsection{Data pipeline}
+
+The pretraining corpus comprises 100B tokens drawn from six sources
+with the following mixture weights:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrl}
+\toprule
+\textbf{Source} & \textbf{Share} & \textbf{Filter} \\
+\midrule
+The Stack v2 dedup (Python, JS, TS, Rust, Go, C, C++, Java) & 55\% & stars $\geq 5$, permissive licenses \\
+FineWeb-Edu                                                  & 20\% & educational score $\geq 3$ \\
+Cosmopedia v2 (synthetic textbooks)                          & 10\% & --- \\
+OpenWebMath + AutoMathText                                   & 5\%  & math reasoning \\
+GitHub issues + PR discussions                               & 5\%  & code-adjacent NL \\
+StackExchange (code tags) + Wikipedia (en)                   & 5\%  & Q\&A, general knowledge floor \\
+\bottomrule
+\end{tabular}
+\caption{Pretraining data mixture (100B tokens total).}
+\label{tab:datamix}
+\end{table}
+
+The pipeline applies (in order): language and quality filtering,
+MinHash deduplication, contamination scrubbing against every planned
+evaluation benchmark (HumanEval, MBPP, MMLU, GSM8K, ARC, HellaSwag,
+plus our novel void-cli-bench), FIM reformatting on 50\% of code
+samples, and repository-aware sequence packing for the Stack subset.
+Tokenization uses a BPE tokenizer with 49{,}152 tokens, including FIM
+sentinels and ChatML special tokens for later SFT compatibility.
+
+\subsection{Curriculum: three-stage annealing}
+
+Following \citet{allal2025smollm2}, we adopt a three-stage curriculum:
+\begin{itemize}[leftmargin=1.5em,itemsep=0.2em]
+    \item \textbf{Stage 1 (85B tokens):} Broad mix per
+          Table~\ref{tab:datamix}, cosine learning rate schedule with
+          peak $3 \times 10^{-4}$, linear warmup over 2000 steps.
+    \item \textbf{Stage 2 (10B tokens):} Anneal data mixture toward
+          code and math (Stack 60\%, Cosmopedia 20\%, OpenWebMath 15\%,
+          rest 5\%). Learning rate decays via cosine to $3 \times 10^{-5}$.
+    \item \textbf{Stage 3 (5B tokens):} Cosmopedia and highest-quality
+          code only. Add teacher distillation objective
+          (\S\ref{sec:distill}). Learning rate anneals to near zero.
+\end{itemize}
+This three-stage schedule is empirically worth 2--5 downstream evaluation
+points at negligible compute cost.
+
+\subsection{Knowledge distillation}
+\label{sec:distill}
+
+During Stage 3, we combine the standard cross-entropy loss with a
+Kullback-Leibler divergence to the output distribution of
+Qwen2.5-Coder-7B~\citep{hui2024qwen25coder} (chosen as a code-specialist
+teacher rather than a general-purpose teacher):
+\begin{equation}
+\mathcal{L}_\text{stage3}
+   = (1 - \beta) \mathcal{L}_\text{CE}(p_\text{student}, y)
+   + \beta \cdot T^2 \cdot \mathrm{KL}(p_\text{teacher}^{/T}
+                                         \, \| \, p_\text{student}^{/T}),
+\end{equation}
+with temperature $T = 2$ and distillation weight $\beta = 0.5$.
+Teacher logits are computed once and cached on HuggingFace Hub as
+compressed tensors ($\text{top-}k=100$ per position, saving $\sim 400\times$
+storage over full logits) prior to Stage 3 training.
+
+\subsection{Post-training}
+
+We produce two release variants:
+\begin{itemize}[leftmargin=1.5em,itemsep=0.2em]
+    \item \textbf{void-v1-base}: the pretrained model, model-souped from
+          the last three Stage 3 checkpoints via uniform averaging.
+    \item \textbf{void-v1-instruct}: base + supervised fine-tuning on
+          100k instruction samples
+          (self-oss-instruct-sc2-exec-filter-50k, OpenHermes-2.5 subset,
+          no\_robots) + Direct Preference
+          Optimization~\citep{rafailov2023dpo} on 30k pairs of
+          UltraFeedback-clean.
+\end{itemize}
+
+%======================================================================
+\section{Theoretical Comparison with Reference Models}
+\label{sec:compare}
+%======================================================================
+
+Table~\ref{tab:compare} places void\_v1 alongside five reference
+models in the 350M--1.3B parameter range. All quality figures for reference
+models are published; the void\_v1 column shows the configuration
+targets and \emph{expected} evaluation numbers under the training recipe
+of \S\ref{sec:training}.
+
+\begin{table}[h]
+\centering
+\scriptsize
+\begin{tabular}{lccccccc}
+\toprule
+\textbf{Feature}
+    & \textbf{Pythia-410M}
+    & \textbf{MobileLLM-350M}
+    & \textbf{SmolLM2-360M}
+    & \textbf{Qwen2.5-C-0.5B}
+    & \textbf{DeepSeek-C-1.3B}
+    & \textbf{void\_v1} \\
+\midrule
+Params (M)
+    & 410 & 350 & 362 & 494 & 1300 & \textbf{485} \\
+Layers
+    & 24 & 30 & 32 & 24 & 24 & \textbf{32} \\
+Hidden
+    & 1024 & 960 & 960 & 896 & 2048 & \textbf{960} \\
+GQA ratio
+    & 1 (MHA) & 3 & 3 & 7 & 1 (MHA) & \textbf{3} \\
+RoPE $\theta$
+    & 10k & 10k & 10k & 1M & 10k & \textbf{500k} \\
+Attention pattern
+    & full & full & full & full & full & \textbf{mixed SW/full} \\
+QK-norm
+    & no & no & no & no & no & \textbf{yes} \\
+Differential attention
+    & no & no & no & no & no & \textbf{yes} \\
+MTP heads
+    & no & no & no & no & no & \textbf{yes (2)} \\
+Register tokens
+    & no & no & no & no & no & \textbf{yes (4)} \\
+FIM
+    & no & no & no & yes & yes & \textbf{yes} \\
+Optimizer
+    & AdamW & AdamW & AdamW & AdamW & AdamW & \textbf{Muon+AdamW} \\
+Training tokens
+    & 300B & 1T & 4T & 5.5T & 2T & \textbf{100B target} \\
+Distillation
+    & no & no & no & no & no & \textbf{stage-3 from Qwen2.5-C-7B} \\
+\midrule
+HumanEval (pass@1)
+    & 2.4 & 8.6 & 12.8 & 40.5 & 34.8 & \textbf{25--32 (expected)} \\
+MBPP (pass@1)
+    & $\sim 3$ & --- & 15.6 & 40.4 & 55.6 & \textbf{25--32 (expected)} \\
+MMLU
+    & 25.7 & 25.7 & 24.7 & 30.5 & --- & \textbf{28--32 (expected)} \\
+HellaSwag
+    & 40.6 & 49.6 & 54.6 & 55.5 & --- & \textbf{50--55 (expected)} \\
+\bottomrule
+\end{tabular}
+\caption{Theoretical comparison of void\_v1 with reference sub-1.3B
+         models. Reference numbers from published model cards and
+         technical reports. void\_v1 numbers are \emph{expected values}
+         conditioned on the training recipe of \S\ref{sec:training};
+         see \S\ref{sec:expected-range} for the derivation.}
+\label{tab:compare}
+\end{table}
+
+\subsection{How expected values are derived}
+\label{sec:expected-range}
+
+The expected value ranges in Table~\ref{tab:compare} are derived as follows:
+
+\begin{enumerate}[leftmargin=1.5em,itemsep=0.2em]
+    \item \textbf{Anchor point.} Qwen2.5-Coder-0.5B (494M parameters, 5.5T
+          tokens) establishes the \emph{ceiling} for the size class on
+          HumanEval and MBPP at $\sim 40$. This is a $55 \times$ over-training
+          margin relative to Chinchilla-optimal for 494M.
+    \item \textbf{Under-training penalty.} void\_v1 targets 100B tokens
+          ($\sim 20 \times$ Chinchilla-optimal for 485M parameters). By the
+          Chinchilla scaling laws \citep{hoffmann2022training}, halving
+          the training-token budget of a small model incurs a
+          $\sim 0.02$ loss increase in cross-entropy, which corresponds
+          empirically to $\sim 20$--$30\%$ HumanEval degradation. Extrapolating
+          from Qwen's 40.5 to our $55 \times$ smaller token budget gives a
+          na\"ive floor of $\sim 20$--$25$.
+    \item \textbf{Data-quality bonus.} FineWeb-Edu score-filtered data and
+          Cosmopedia synthetic textbooks demonstrate $\sim 5$--$8$-point
+          improvements on HellaSwag/MMLU for comparable models
+          \citep{allal2025smollm2}, and analogous gains are expected for
+          code metrics from our filtered Stack v2 subset.
+    \item \textbf{Distillation bonus.} Stage-3 distillation from
+          Qwen2.5-Coder-7B is expected to add $\sim 3$--$6$ points on
+          HumanEval based on published distillation work
+          \citep{team2024gemma2}.
+    \item \textbf{Differential Attention bonus (speculative).} The
+          published DIFF-Transformer ablations at 3B parameters show a
+          $\sim 5$--$10\%$ perplexity improvement, which historically
+          translates to $\sim 1$--$3$ downstream evaluation points at
+          our scale. This is our research bet: the value could plausibly
+          be 0 (no help at this scale) or as high as $\sim 5$ points
+          (matching published ablations at larger scale).
+\end{enumerate}
+
+Summing the anchor floor with these adjustments yields the expected
+HumanEval range of $\sim 25$--$32$. We stress this is a design-time
+projection; the actual outcome will be determined empirically.
+
+%======================================================================
+\section{Risks and Ablation Plan}
+\label{sec:risks}
+%======================================================================
+
+Every novel or non-standard component carries a documented rollback path:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{p{4cm} p{4cm} p{6cm}}
+\toprule
+\textbf{Component} & \textbf{Failure mode} & \textbf{Rollback} \\
+\midrule
+Differential Attention & Training diverges or degrades quality after 20B tokens & Set $W_{Q_2} = W_{K_2} = 0$ at init, $\lambda = 0$; falls back to standard GQA. \\
+Multi-Token Prediction & Auxiliary loss dominates or destabilises training & Set $\alpha_2 = \alpha_3 = 0$; heads are discarded and only next-token loss remains. \\
+Register tokens & No measurable benefit at 20B-token milestone & Remove; retraining continues from the checkpoint with 4 fewer positions per sequence. \\
+Muon optimizer & Instability or NaN loss & Swap to pure AdamW at any checkpoint; parameter update rule change only. \\
+Mixed attention pattern & Long-range integration failure on evals & Convert all sliding-window layers to full attention; adds $\sim 40\%$ FLOPs per layer. \\
+Teacher distillation (Stage 3) & Teacher too different from student $\to$ destabilises anneal & Drop the KL term; Stage 3 reduces to standard cross-entropy on Cosmopedia. \\
+\bottomrule
+\end{tabular}
+\caption{Risk register with graceful-degradation rollbacks.}
+\end{table}
+
+\paragraph{Fail-fast evaluation gates.} We commit to evaluate at 20B, 50B,
+85B, 95B, and 100B tokens. If HumanEval at the 20B-token milestone is
+below 8 (the SmolLM2-360M level with $50 \times$ our tokens), we halt training,
+diagnose, and consider rollback before spending the remaining 80\% of
+compute budget.
+
+%======================================================================
+\section{Evaluation}
+\label{sec:eval}
+%======================================================================
+
+\subsection{Standard benchmarks}
+We report on \texttt{bigcode-evaluation-harness} (HumanEval, HumanEval-FIM,
+MBPP) and \texttt{lm-eval-harness} (MMLU, HellaSwag, ARC-Easy,
+ARC-Challenge, PIQA, WinoGrande, GSM8K with chain-of-thought). All
+benchmarks are contamination-checked against the training corpus.
+
+\subsection{void-cli-bench}
+
+We introduce a novel domain-specific evaluation: a suite of $\sim 200$
+command-line reasoning tasks drawn from open-source CLI codebases (fish,
+zsh, ripgrep, fzf, bat, exa) covering (a) command completion given partial
+input and history, (b) shell-script bug localisation, (c) man-page-based
+argument recall, and (d) pipeline construction from natural-language
+specifications. Contamination checks against the CLI codebase source are
+enforced at data-pipeline time.
+
+%======================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+%======================================================================
+
+We have specified the design of void\_v1, a 485M-parameter decoder-only
+language model that combines a proven-in-2024 core (deep-narrow scaling,
+GQA, RoPE, RMSNorm, SwiGLU, mixed attention, MTP, register tokens,
+QK-norm, Muon optimizer) with one deliberately novel bet: Differential
+Attention at the sub-1B scale. We formalised the noise-cancellation
+argument for Differential Attention as a theorem on expected off-diagonal
+attention mass, derived the parameter and FLOP budgets from first
+principles, and placed the design in a theoretical comparison with five
+reference models. The design paper commits us to a specific training
+recipe (100B tokens across three curriculum stages, teacher distillation
+from Qwen2.5-Coder-7B, Muon+AdamW hybrid optimization) and to a fail-fast
+evaluation protocol with documented rollbacks for every novel component.
+
+The empirical validation of every claim in this document remains open.
+The next milestone is a 10M-parameter debug configuration trained on
+$\sim 100$M tokens, which will validate the pipeline and provide the first
+empirical read on whether Differential Attention produces cleaner
+attention maps at our scale before we commit to the full run.
+
+%======================================================================
+\begin{thebibliography}{99}
+\small
+
+\bibitem[Ainslie et al.(2023)]{ainslie2023gqa}
+Ainslie, J., Lee-Thorp, J., de Jong, M., Zemlyanskiy, Y., Lebr\'on, F., \&
+Sanghai, S. (2023). GQA: Training Generalized Multi-Query Transformer
+Models from Multi-Head Checkpoints. \emph{arXiv:2305.13245}.
+
+\bibitem[Allal et al.(2025)]{allal2025smollm2}
+Allal, L. B., et al. (2025). SmolLM2: When Smol Goes Big --- Data-Centric
+Training of a Small Language Model. \emph{arXiv:2502.02737}.
+
+\bibitem[Bavarian et al.(2022)]{bavarian2022fim}
+Bavarian, M., Jun, H., Tezak, N., et al. (2022). Efficient Training of
+Language Models to Fill in the Middle. \emph{arXiv:2207.14255}.
+
+\bibitem[Biderman et al.(2023)]{biderman2023pythia}
+Biderman, S., et al. (2023). Pythia: A Suite for Analyzing Large Language
+Models Across Training and Scaling. \emph{ICML}.
+
+\bibitem[Caruana(1997)]{caruana1997multitask}
+Caruana, R. (1997). Multitask Learning. \emph{Machine Learning}, 28, 41--75.
+
+\bibitem[Chameleon Team(2024)]{chameleon2024}
+Chameleon Team. (2024). Chameleon: Mixed-Modal Early-Fusion Foundation
+Models. \emph{arXiv:2405.09818}.
+
+\bibitem[Darcet et al.(2024)]{darcet2024registers}
+Darcet, T., Oquab, M., Mairal, J., \& Bojanowski, P. (2024). Vision
+Transformers Need Registers. \emph{ICLR}.
+
+\bibitem[DeepSeek-AI(2024)]{deepseek2024v3}
+DeepSeek-AI. (2024). DeepSeek-V3 Technical Report.
+\emph{arXiv:2412.19437}.
+
+\bibitem[Dehghani et al.(2023)]{dehghani2023vit22b}
+Dehghani, M., et al. (2023). Scaling Vision Transformers to 22 Billion
+Parameters. \emph{ICML}.
+
+\bibitem[Gao et al.(2020)]{gao2020pile}
+Gao, L., et al. (2020). The Pile: An 800GB Dataset of Diverse Text for
+Language Modeling. \emph{arXiv:2101.00027}.
+
+\bibitem[Gloeckle et al.(2024)]{gloeckle2024mtp}
+Gloeckle, F., Idrissi, B. Y., Rozi\`ere, B., et al. (2024). Better \&
+Faster Large Language Models via Multi-token Prediction.
+\emph{arXiv:2404.19737}.
+
+\bibitem[Guo et al.(2024)]{guo2024deepseekcoder}
+Guo, D., et al. (2024). DeepSeek-Coder: When the Large Language Model
+Meets Programming --- The Rise of Code Intelligence.
+\emph{arXiv:2401.14196}.
+
+\bibitem[Hoffmann et al.(2022)]{hoffmann2022training}
+Hoffmann, J., et al. (2022). Training Compute-Optimal Large Language
+Models. \emph{arXiv:2203.15556}.
+
+\bibitem[Hui et al.(2024)]{hui2024qwen25coder}
+Hui, B., et al. (2024). Qwen2.5-Coder Technical Report.
+\emph{arXiv:2409.12186}.
+
+\bibitem[Jiang et al.(2023)]{jiang2023mistral}
+Jiang, A. Q., et al. (2023). Mistral 7B. \emph{arXiv:2310.06825}.
+
+\bibitem[Jordan(2024)]{jordan2024muon}
+Jordan, K. (2024). Muon: An Optimizer for Hidden Layers in Neural
+Networks. \url{https://kellerjordan.github.io/posts/muon/}.
+
+\bibitem[Liu et al.(2024)]{liu2024mobilellm}
+Liu, Z., Zhao, C., Iandola, F., et al. (2024). MobileLLM: Optimizing
+Sub-billion Parameter Language Models for On-Device Use Cases.
+\emph{arXiv:2402.14905}.
+
+\bibitem[Loshchilov \& Hutter(2019)]{loshchilov2019adamw}
+Loshchilov, I., \& Hutter, F. (2019). Decoupled Weight Decay
+Regularization. \emph{ICLR}.
+
+\bibitem[Rafailov et al.(2023)]{rafailov2023dpo}
+Rafailov, R., et al. (2023). Direct Preference Optimization: Your
+Language Model is Secretly a Reward Model. \emph{NeurIPS}.
+
+\bibitem[Shazeer(2020)]{shazeer2020swiglu}
+Shazeer, N. (2020). GLU Variants Improve Transformer.
+\emph{arXiv:2002.05202}.
+
+\bibitem[Su et al.(2024)]{su2024roformer}
+Su, J., Lu, Y., Pan, S., Murtadha, A., Wen, B., \& Liu, Y. (2024).
+RoFormer: Enhanced Transformer with Rotary Position Embedding.
+\emph{Neurocomputing}, 568, 127063.
+
+\bibitem[Team(2024)]{team2024gemma2}
+Gemma Team. (2024). Gemma 2: Improving Open Language Models at a
+Practical Size. \emph{arXiv:2408.00118}.
+
+\bibitem[Touvron et al.(2023)]{touvron2023llama}
+Touvron, H., et al. (2023). LLaMA: Open and Efficient Foundation
+Language Models. \emph{arXiv:2302.13971}.
+
+\bibitem[Ye et al.(2024)]{ye2024differential}
+Ye, T., Dong, L., Xia, Y., et al. (2024). Differential Transformer.
+\emph{arXiv:2410.05258}.
+
+\bibitem[Zhang \& Sennrich(2019)]{zhang2019rmsnorm}
+Zhang, B., \& Sennrich, R. (2019). Root Mean Square Layer Normalization.
+\emph{NeurIPS}.
+
+\end{thebibliography}
+
+\end{document}
