@@ -1,0 +1,88 @@
+model:
+  dim: 960
+  n_layers: 32
+  n_heads: 15
+  n_kv_heads: 5
+  head_dim: 64
+  ffn_dim: 2560
+  vocab_size: 49152
+  max_seq_len: 2048
+  rope_theta: 500000.0
+  norm_eps: 1.0e-5
+  qk_norm: true
+  attn_kind: diff-gqa
+  attn_pattern:
+    [full, full, full, full,
+     sw, sw, sw, full,
+     sw, sw, sw, full,
+     sw, sw, sw, full,
+     sw, sw, sw, full,
+     sw, sw, sw, full,
+     full, full, full, full,
+     full, full, full, full]
+  sw_size: 512
+  lambda_init_base: 0.8
+  lambda_init_decay: 0.3
+  tie_v: true
+  n_registers: 4
+  n_mtp_heads: 2
+  mtp_loss_weight: 0.3
+  tie_embeddings: true
+  init_std: 0.02
+
+train:
+  seq_len: 2048
+  micro_batch: 8
+  grad_accum: 32
+  total_tokens: 100_000_000_000
+  dtype: bfloat16
+  grad_ckpt: true
+  flash_attn: true
+  liger: true
+  seed: 42
+
+  optim:
+    hidden_kind: muon
+    hidden_lr: 6.0e-4
+    other_lr: 3.0e-4
+    betas: [0.9, 0.95]
+    weight_decay: 0.1
+    warmup_steps: 2000
+    min_lr_frac: 0.1
+    grad_clip: 1.0
+    z_loss: 1.0e-4
+
+  ckpt_interval: 1000
+  ckpt_keep: 5
+  hub_repo: Quantum-Blade1/void-v1-base
+  log_interval: 50
+  wandb_project: void-v1
+
+stages:
+  - name: broad
+    tokens: 85_000_000_000
+    mix: configs/mix.stage1.yaml
+  - name: anneal
+    tokens: 10_000_000_000
+    mix: configs/mix.stage2.yaml
+  - name: distill
+    tokens: 5_000_000_000
+    mix: configs/mix.stage3.yaml
+    teacher: Qwen/Qwen2.5-Coder-7B
+    teacher_beta: 0.5
+    teacher_temp: 2.0
+
+sft:
+  dataset: Quantum-Blade1/void-sft
+  epochs: 3
+  batch: 16
+  lr: 2.0e-5
+
+dpo:
+  dataset: Quantum-Blade1/void-dpo
+  beta: 0.1
+  epochs: 1
+  lr: 5.0e-7
+
+tokenizer_repo: Quantum-Blade1/void-tokenizer
+corpus_repo: Quantum-Blade1/void-corpus-v1

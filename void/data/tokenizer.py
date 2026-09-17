@@ -1,8 +1,15 @@
-"""BPE tokenizer training and inference wrapper.
+from __future__ import annotations
 
-Trains a 49,152-vocab BPE tokenizer with byte-level fallback. Special tokens include
-FIM sentinels (<|fim_prefix|>, <|fim_middle|>, <|fim_suffix|>), ChatML delimiters
-(<|im_start|>, <|im_end|>), and register-token placeholders.
+from pathlib import Path
 
-Uses HuggingFace tokenizers lib for training; exports as .json compatible with
-transformers.PreTrainedTokenizerFast for inference."""
+FIM_TOKENS = ("<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>")
+CHATML_TOKENS = ("<|im_start|>", "<|im_end|>")
+SPECIAL_TOKENS = ("<|endoftext|>", *FIM_TOKENS, *CHATML_TOKENS)
+
+
+def train_bpe(corpus_glob: str, vocab_size: int, out: Path) -> None:
+    raise NotImplementedError
+
+
+def load(path: str | Path):  # returns transformers.PreTrainedTokenizerFast
+    raise NotImplementedError

@@ -1,7 +1,19 @@
-"""Stage-3 knowledge distillation from a teacher model.
+from __future__ import annotations
 
-Loads pre-cached top-k=100 teacher logits from HF Hub (compressed, ~400x storage
-saving vs full logits). Computes KL(teacher || student) with temperature T,
-combined with the standard CE loss as: loss = (1-beta)*CE + beta*T^2*KL.
+import torch.nn.functional as F
+from torch import Tensor
 
-Design ref: paper/void_v1.tex §5.3."""
+
+def kl_from_topk(student_logits: Tensor, teacher_topk_ids: Tensor, teacher_topk_logits: Tensor, T: float) -> Tensor:
+    """KL(teacher || student) computed only over the teacher's top-k tokens.
+
+    student_logits:      [B, T, V]
+    teacher_topk_ids:    [B, T, k]  int64
+    teacher_topk_logits: [B, T, k]  fp32
+    """
+    raise NotImplementedError
+
+
+def cache_teacher_logits(teacher_repo: str, shards: list[str], top_k: int, out_repo: str) -> None:
+    """One-off caching pass over the corpus; ~400× storage saving vs full logits."""
+    raise NotImplementedError

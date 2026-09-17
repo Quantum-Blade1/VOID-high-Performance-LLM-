@@ -1,39 +1,19 @@
-# ADR-XXXX: <Short title>
+# NNNN — Title
 
-**Status:** proposed | accepted | superseded by ADR-YYYY | deprecated
-**Date:** YYYY-MM-DD
-**Deciders:** <names>
-**Consulted:** <sources / papers / prior ADRs>
-
-## Context
-
-What is the problem we are solving? What forces are at play (technical, budget, timeline, risk)?
+**Status:** proposed | accepted | superseded by NNNN · **Date:** YYYY-MM-DD
 
 ## Decision
 
-The choice we are making, stated in a single sentence.
+One sentence.
 
-## Rationale
+## Why
 
-Why this choice, and why not the alternatives. Cite prior art. If the decision is a research bet rather than a settled question, mark it as such and state the falsification criterion.
+Bullets. Include enough that a future maintainer can judge whether the reason still holds.
 
-## Alternatives considered
+## Alternatives rejected
 
-| Option | Pros | Cons | Reason not chosen |
-|---|---|---|---|
-| A | ... | ... | ... |
-| B | ... | ... | ... |
+Three or four rows, one line each.
 
-## Consequences
+## Rollback
 
-- Positive: ...
-- Negative: ...
-- Reversible / irreversible? ...
-
-## Rollback plan
-
-If this decision turns out wrong, how do we undo it and what does that cost?
-
-## Open questions
-
-- ...
+How to undo, what it costs.
